@@ -113,6 +113,8 @@
   .msg{font-size:12.5px;color:var(--danger);display:none}
   .msg.on{display:block}
   .note{font-size:12px;color:var(--sub);line-height:1.55}
+  .sel{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff;
+    font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer}
   hr.sep{border:none;border-top:1px solid var(--line)}
 
   @media (max-width: 900px){
@@ -188,6 +190,16 @@
         <input type="range" id="opacityRange" min="10" max="100" step="1">
       </div>
 
+      <div class="field">
+        <label>输出清晰度</label>
+        <select id="sizeSel" class="sel">
+          <option value="0">跟源片一致（不放大）</option>
+          <option value="1440">长边 2560（2K）</option>
+          <option value="2160">长边 3840（4K）</option>
+        </select>
+        <span class="note" style="display:block;margin-top:6px">放大只提高像素尺寸，不能变出源片没有的细节。</span>
+      </div>
+
       <hr class="sep">
 
       <button type="button" class="btn-primary" id="runBtn" disabled>开始生成</button>
@@ -208,7 +220,7 @@
         <button type="button" class="btn-ghost" id="againBtn">再做一个</button>
       </div>
 
-      <p class="note">设置会自动保存在本机浏览器中，下次打开沿用上次的位置与大小。按原速逐帧绘制，输出分辨率与源片一致、画质不降级。</p>
+      <p class="note">设置会自动保存在本机浏览器中，下次打开沿用上次的位置、大小与清晰度。逐帧精确绘制，帧率跟随源片（24/30/60fps 原样保留）。</p>
     </aside>
   </div>
 </div>
@@ -238,6 +250,7 @@
       videoFname=$('videoFname'), imgFname=$('imgFname'),
       ratioRange=$('ratioRange'), marginRange=$('marginRange'), opacityRange=$('opacityRange'),
       ratioVal=$('ratioVal'), marginVal=$('marginVal'), opacityVal=$('opacityVal'),
+      sizeSel=$('sizeSel'),
       runBtn=$('runBtn'), errMsg=$('errMsg'),
       progress=$('progress'), barFill=$('barFill'), pLabel=$('pLabel'), pPercent=$('pPercent'),
       result=$('result'), resultMeta=$('resultMeta'), downloadBtn=$('downloadBtn'), againBtn=$('againBtn'),
@@ -245,7 +258,7 @@
 
   /* ---------- 配置持久化 ---------- */
   function loadConfig(){
-    var def = {position:'br', ratio:25, margin:24, opacity:100};
+    var def = {position:'br', ratio:25, margin:24, opacity:100, maxEdge:0};
     try{
       var raw = localStorage.getItem(STORE_KEY);
       if(raw){ var s = JSON.parse(raw); return Object.assign(def, s); }
@@ -276,6 +289,11 @@
 
   /* ---------- 滑块 ---------- */
   ratioRange.value=cfg.ratio; marginRange.value=cfg.margin; opacityRange.value=cfg.opacity;
+  sizeSel.value=String(cfg.maxEdge||0);
+  sizeSel.addEventListener('change',function(){
+    cfg.maxEdge=parseInt(this.value,10)||0;
+    saveConfig(); syncResBadge();
+  });
   ratioRange.addEventListener('input',function(){
     cfg.ratio=parseInt(this.value,10); ratioVal.textContent=cfg.ratio+'%';
     saveConfig(); applyOverlay();
@@ -292,6 +310,23 @@
     ratioVal.textContent=cfg.ratio+'%';
     marginVal.textContent=cfg.margin+' px';
     opacityVal.textContent=cfg.opacity+'%';
+  }
+
+  /* 预览角标：源尺寸 →（放大时）输出尺寸 + 音轨 + 时长 */
+  function syncResBadge(){
+    if(!video.videoWidth){ resBadge.textContent='未加载视频'; return; }
+    var sw=Math.round(video.videoWidth), sh=Math.round(video.videoHeight);
+    var o=outputSize(sw,sh,cfg.maxEdge);
+    var sizeTxt = (o.w===sw && o.h===sh) ? (sw+'×'+sh) : (sw+'×'+sh+' → '+o.w+'×'+o.h);
+    var durTxt = (isFinite(state.duration) && state.duration>0) ? ' · '+state.duration.toFixed(1)+'s' : '';
+    resBadge.textContent = sizeTxt + (state.hasAudio?' · 含音频':' · 静音') + durTxt;
+  }
+
+  /* 输出尺寸：maxEdge=0 跟源片一致；指定长边时等比放大，取偶数像素避免编码器裁剪 */
+  function outputSize(w,h,maxEdge){
+    if(!maxEdge || maxEdge<=Math.max(w,h)) return {w:w,h:h};
+    var k=maxEdge/Math.max(w,h);
+    return {w:Math.round(w*k/2)*2, h:Math.round(h*k/2)*2};
   }
 
   /* ---------- 文件选择 ---------- */
@@ -344,9 +379,7 @@
     /* 不再限制时长：视频能解码即用，时长只作提示 */
     state.videoReady=true;
     dropZone.style.display='none';
-    var durTxt = isFinite(state.duration) ? state.duration.toFixed(1)+'s' : '';
-    resBadge.textContent=Math.round(video.videoWidth)+'×'+Math.round(video.videoHeight)+
-      (state.hasAudio?' · 含音频':' · 静音')+(durTxt?' · '+durTxt:'');
+    syncResBadge();
     applyOverlay(); updateRunBtn();
   });
   video.addEventListener('error',function(){
@@ -459,16 +492,21 @@
     progress.classList.add('on');
     barFill.style.width='0%'; pPercent.textContent='0%';
 
-    /* 离线逐帧 seek 方案：不实时播放，每帧精确定位再编码。
-       彻底解决 rAF 节流、编码器 backpressure、帧错位导致的卡顿。
-       输出标准非 fragmented MP4（X 兼容），60fps，带音频。 */
-    var W=video.videoWidth, H=video.videoHeight;
+    /* 离线逐帧 seek 方案：不实时播放，每帧定位到源片真实帧边界再编码。
+       步长取源片真实帧周期（先探测），不再一律按 60fps 补帧——给 30fps
+       素材补 60fps，等于每两帧重复一次，播放器看着就是一顿一顿的。
+       输出标准非 fragmented MP4（X 兼容），带音频。 */
+    var srcW=video.videoWidth, srcH=video.videoHeight;
+    var outSz=outputSize(srcW,srcH,cfg.maxEdge);
+    var W=outSz.w, H=outSz.h;
     var canvas=document.createElement('canvas');
     canvas.width=W; canvas.height=H;
     var ctx=canvas.getContext('2d',{colorSpace:'srgb'});
-    ctx.imageSmoothingEnabled=false;
+    /* 只有真正放大时才开插值；1:1 绘制保持原始像素 */
+    ctx.imageSmoothingEnabled=(W!==srcW||H!==srcH);
+    ctx.imageSmoothingQuality='high';
 
-    var frameCount=0, settled=false;
+    var frameCount=0, settled=false, skipFrames=0, encErrors=0;
     var FRAME_S=1/60, FRAME_US=Math.round(1e6/60);
 
     function cleanup(){
@@ -477,19 +515,22 @@
     }
     function fail(msg){ if(settled) return; settled=true; cleanup(); failProcess(msg); }
 
+    /* 等"目标帧真的解码出来"再返回；超时不再静默放行，交回调用方重试 */
+    /* 已经在目标时刻且该帧可读：直接返回，省掉一次必然超时的 seek（首帧最常见） */
     function seekTo(t){
       return new Promise(function(res){
-        var done=false;
-        function onSeeked(){
+        if(Math.abs(video.currentTime-t)<0.001 && video.readyState>=2){ res(true); return; }
+        var done=false, timer=null;
+        function finish(ok){
           if(done) return; done=true;
           video.removeEventListener('seeked',onSeeked);
-          res();
+          if(timer) clearTimeout(timer);
+          res(ok);
         }
+        function onSeeked(){ finish(true); }
         video.addEventListener('seeked',onSeeked);
         video.currentTime=t;
-        setTimeout(function(){
-          if(!done){ done=true; video.removeEventListener('seeked',onSeeked); res(); }
-        },800);
+        timer=setTimeout(function(){ finish(false); },1500);
       });
     }
     function waitRaf(){
@@ -501,6 +542,10 @@
     }
 
     (async function(){
+      /* 0. 探测源片真实帧率：后续步长与时间戳都以它为基准 */
+      var fps=await probeFps();
+      FRAME_S=1/fps; FRAME_US=Math.round(1e6/fps);
+
       /* 1. 音频重采样 */
       var audioBuffer=null;
       if(state.hasAudio){
@@ -515,18 +560,20 @@
         }catch(e){ audioBuffer=null; state.hasAudio=false; }
       }
 
-      /* 2. muxer */
+      /* 2. muxer：视频 timescale 直接取帧率，一帧正好一个 tick，
+         24/30fps 不会因为 timescale=60 变成 2/3 tick 交替（33ms、50ms 抖动） */
       var muxer=new Mp4Muxer.Muxer({
         target: new Mp4Muxer.ArrayBufferTarget(),
-        video:{ codec:'avc', width:W, height:H, frameRate:60 },
+        video:{ codec:'avc', width:W, height:H, frameRate:fps },
         audio: audioBuffer ? { codec:'aac', numberOfChannels:2, sampleRate:48000 } : undefined,
         fastStart:'in-memory',
         firstTimestampBehavior:'offset'
       });
 
-      /* 3. 视频编码器：CBR 保证码率稳定，文件大小可预期 */
-      var avcCodec=await pickAvcCodec(W,H);
-      var vBitrate=pickVideoBitrate(W,H);
+      /* 3. 视频编码器：VBR + quality，按画面复杂度分配码率；
+         CBR 会把每帧压在固定预算上，静态镜头浪费、运动镜头又被摊薄 */
+      var avcCodec=await pickAvcCodec(W,H,fps);
+      var vBitrate=pickVideoBitrate(W,H,fps);
       var videoBytes=0;
       var videoEncoder=new VideoEncoder({
         output:function(chunk,meta){
@@ -536,8 +583,8 @@
       });
       videoEncoder.configure({
         codec:avcCodec, width:W, height:H,
-        bitrate:vBitrate, framerate:60, latencyMode:'quality',
-        bitrateMode:'constant',
+        bitrate:vBitrate, framerate:fps, latencyMode:'quality',
+        bitrateMode:'variable',
         avc:{format:'avc'}
       });
 
@@ -569,13 +616,20 @@
         }
       }
 
-      /* 5. 逐帧 seek 编码 */
+      /* 5. 逐帧 seek 编码：步长=源帧周期，时间戳=帧序号×帧周期，帧间隔恒定 */
       video.muted=true;
       video.pause();
+      /* 先等首帧的数据真的到位，否则 i=0 那次 seek 会白等到超时（还误记一次补帧） */
+      await new Promise(function(res){
+        if(video.readyState>=2) return res();
+        video.addEventListener('loadeddata',res,{once:true});
+        setTimeout(res,800);
+      });
       var dur=isFinite(state.duration)?state.duration:0;
       if(dur<=0){ fail('视频时长异常'); return; }
-      var totalFrames=Math.ceil(dur/FRAME_S);
-      pLabel.textContent='处理中（逐帧精确编码，保证 60fps 不卡顿）…';
+      var totalFrames=Math.max(1,Math.round(dur*fps));
+      var keyEvery=Math.max(1,Math.round(fps)); /* 每秒一个关键帧，便于拖动 */
+      pLabel.textContent='处理中（按源片帧率逐帧精确编码）…';
 
       for(var i=0;i<totalFrames;i++){
         if(settled) return;
@@ -583,9 +637,11 @@
         if(t>dur) t=dur;
         var pct=Math.round(i/totalFrames*100);
         barFill.style.width=pct+'%'; pPercent.textContent=pct+'%';
-        /* seek 到精确时刻：seeked 触发时该帧已解码，可直接 drawImage，
-           不再额外等 rAF（每帧省 30ms+，整体速度明显提升） */
-        await seekTo(t);
+        /* seek 到帧边界：seeked 触发时该帧已解码，可直接 drawImage。
+           超时说明这帧没解出来，重试一次；仍失败就记账（画面会重复一帧） */
+        var seekedOk=await seekTo(t);
+        if(!seekedOk) seekedOk=await seekTo(t);
+        if(!seekedOk) skipFrames++;
         ctx.drawImage(video,0,0,W,H);
         drawWatermark(ctx,W,H);
         /* 编码器队列深了才等：阈值放宽到 16，让硬件编码器并行消化，
@@ -603,10 +659,10 @@
           });
         }
         try{
-          var vf=new VideoFrame(canvas,{timestamp:Math.round(t*1e6),duration:FRAME_US});
-          videoEncoder.encode(vf,{keyFrame:frameCount%60===0});
+          var vf=new VideoFrame(canvas,{timestamp:Math.round(i*1e6/fps),duration:FRAME_US});
+          videoEncoder.encode(vf,{keyFrame:frameCount%keyEvery===0});
           vf.close(); frameCount++;
-        }catch(e){}
+        }catch(e){ encErrors++; }
       }
 
       /* 6. 收尾 */
@@ -620,7 +676,8 @@
       settled=true; cleanup();
       finishProcess(blob,'video/mp4',{
         codec:avcCodec, cfgBitrate:vBitrate, frames:frameCount,
-        videoBytes:videoBytes, duration:dur
+        videoBytes:videoBytes, duration:dur,
+        width:W, height:H, fps:fps, skip:skipFrames, encErrors:encErrors
       });
     })().catch(function(e){
       fail(e&&e.message?e.message:e);
@@ -652,7 +709,8 @@
   }
   /* 逐级探测浏览器支持的最高 H.264 profile：High > Main > Baseline，
      level 按 16 对齐后的 coded area 动态匹配，避免 level 撑不住的硬错误 */
-  async function pickAvcCodec(width,height){
+  async function pickAvcCodec(width,height,fps){
+    var rate=fps||60;
     var levelHex=pickAvcLevel(width,height).toString(16).padStart(2,'0');
     var profiles=[0x64,0x4d,0x42]; /* High / Main / Baseline */
     for(var i=0;i<profiles.length;i++){
@@ -661,7 +719,7 @@
       try{
         var r=await VideoEncoder.isConfigSupported({
           codec:codec, width:width, height:height,
-          bitrate:pickVideoBitrate(width,height), framerate:60,
+          bitrate:pickVideoBitrate(width,height,rate), framerate:rate,
           avc:{format:'avc'}
         });
         if(r.supported) return codec;
@@ -671,12 +729,61 @@
     return 'avc1.4200'+levelHex;
   }
 
-  /* 按"像素数 × 60fps × 每像素 0.2bit"自适应码率，60fps 下也有充足码率，
-     避免低码率二次编码把画面压糊；上下限保护防止极端值 */
-  function pickVideoBitrate(width,height){
-    var pixels=width*height;
-    var br=Math.round(pixels*60*0.2);
-    return Math.max(6_000_000, Math.min(80_000_000, br));
+  /* 按"像素数 × 帧率 × 每像素 0.22bit"算目标码率，VBR 下作为上限：
+     1080p30 ≈ 13.7Mbps，4K30 ≈ 55Mbps；下限 8M 避免低分辨率被压糊 */
+  function pickVideoBitrate(width,height,fps){
+    var rate=fps||60;
+    var br=Math.round(width*height*rate*0.22);
+    return Math.max(8_000_000, Math.min(120_000_000, br));
+  }
+
+  /* 探测源片真实帧率：短播 0.3 秒，用 requestVideoFrameCallback 记媒体时间，
+     取最接近的标准帧率（24/25/30/60…）；探测失败退回 60fps，不影响主流程 */
+  function probeFps(){
+    return new Promise(function(res){
+      var fallback=60;
+      if(!video.requestVideoFrameCallback ||
+         !isFinite(state.duration) || state.duration<=0){
+        res(fallback); return;
+      }
+      var samples=[], finished=false, id=null;
+      var prevMuted=video.muted, prevRate=video.playbackRate;
+
+      function stop(){
+        if(finished) return; finished=true;
+        if(id!==null){ try{ video.cancelVideoFrameCallback(id); }catch(e){} }
+        try{ video.pause(); }catch(e){}
+        video.muted=prevMuted; video.playbackRate=prevRate;
+        try{ video.currentTime=0; }catch(e){}
+        var f=fallback;
+        if(samples.length>=4){
+          var span=samples[samples.length-1]-samples[0];
+          var n=samples.length-1;
+          if(span>0.05){
+            var measured=n/span;
+            var cands=[15,24,25,30,48,50,60,90,120];
+            for(var i=0;i<cands.length;i++){
+              if(Math.abs(cands[i]-measured)<=cands[i]*0.05){ f=cands[i]; break; }
+            }
+          }
+        }
+        res(f);
+      }
+      function onFrame(now,meta){
+        if(finished) return;
+        samples.push(meta.mediaTime);
+        var elapsed=(samples.length>1)?(samples[samples.length-1]-samples[0]):0;
+        if(samples.length>=4 && elapsed>=0.3){ stop(); return; }
+        if(samples.length>=40){ stop(); return; }
+        id=video.requestVideoFrameCallback(onFrame);
+      }
+      video.muted=true; video.playbackRate=1;
+      try{ video.currentTime=0; }catch(e){}
+      id=video.requestVideoFrameCallback(onFrame);
+      var p=video.play();
+      if(p && p.catch) p.catch(function(){ stop(); });
+      setTimeout(function(){ if(!finished) stop(); },2500);
+    });
   }
 
   /* 逐个尝试候选格式：某格式录不到数据或报错时自动切下一个，绝不再产出空文件 */
@@ -1008,14 +1115,19 @@
     var outName=base+'_watermark.'+ext;
     var url=URL.createObjectURL(blob);
     var formatNote = ext==='webm' ? '（当前浏览器不支持 MP4 录制，输出为 WebM，无法直接上传 X，请改用系统 Edge/Chrome 打开本页面重新生成）' : '';
-    var outInfo = '输出分辨率：'+Math.round(video.videoWidth)+'×'+Math.round(video.videoHeight)+
-      '（与源片一致） · 60fps · 大小：'+formatSize(blob.size);
+    var sw=Math.round(video.videoWidth), sh=Math.round(video.videoHeight);
+    var dw=(diag&&diag.width)?diag.width:sw, dh=(diag&&diag.height)?diag.height:sh;
+    var fitTxt=(dw===sw&&dh===sh)?'（与源片一致）':'（源片 '+sw+'×'+sh+'，已等比放大）';
+    var fpsTxt=(diag&&diag.fps)?(' · '+diag.fps+'fps'):'';
+    var outInfo = '输出分辨率：'+dw+'×'+dh+fitTxt+fpsTxt+' · 大小：'+formatSize(blob.size);
     /* 诊断行：实际 codec / 实际视频码率，便于判断是否真的走了 WebCodecs 高码率链路 */
     if(diag && diag.codec){
       var mbps = diag.duration>0 ? (diag.videoBytes*8/diag.duration/1e6) : 0;
       outInfo += ' · 编码器：'+diag.codec+' · 帧数：'+diag.frames+
         ' · 实际视频码率：'+mbps.toFixed(1)+'Mbps（目标 '+(diag.cfgBitrate/1e6).toFixed(0)+'M）';
     }
+    if(diag && diag.skip) outInfo += ' · 解码超时补帧：'+diag.skip;
+    if(diag && diag.encErrors) outInfo += ' · 编码失败帧：'+diag.encErrors;
     resultMeta.textContent=outInfo+formatNote+' · 文件名：'+outName;
     result.classList.add('on');
     downloadBtn.onclick=function(){
